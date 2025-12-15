@@ -300,7 +300,42 @@ int query_in_pgtbl(void *pgtbl, vaddr_t va, paddr_t *pa, pte_t **entry)
          * `-ENOMAPPING` if the va is not mapped.
          */
         /* BLANK BEGIN */
+        ptp_t *l0_ptp, *l1_ptp, *l2_ptp, *l3_ptp, *ptp;
+        pte_t *pte;
+        int ret;
 
+        l0_ptp = (ptp_t *)pgtbl;
+        l1_ptp = NULL;
+        l2_ptp = NULL;
+        l3_ptp = NULL;
+
+        // l0
+        ret = get_next_ptp(l0_ptp, L0, va, &l1_ptp, &pte, false, NULL);
+        if(ret == -ENOMAPPING) return ret;
+
+        // l1
+        ret = get_next_ptp(l1_ptp, L1, va, &l2_ptp, &pte, false, NULL);
+        if(ret == -ENOMAPPING) return ret;
+        else if (ret == BLOCK_PTP){
+                if(entry != NULL) *entry = pte;
+                *pa = virt_to_phys((vaddr_t)l2_ptp) + GET_VA_OFFSET_L1(va);
+                return 0;
+        }
+        
+        // l2
+        ret = get_next_ptp(l2_ptp, L2, va, &l3_ptp, &pte, false, NULL);
+        if(ret == -ENOMAPPING) return ret;  
+        else if(ret == BLOCK_PTP){
+                if(entry != NULL) *entry = pte;
+                *pa = virt_to_phys((vaddr_t)l3_ptp) + GET_VA_OFFSET_L2(va);
+                return 0;
+        }
+
+        // l3
+        ret = get_next_ptp(l3_ptp, L3, va, &ptp, &pte, false, NULL);
+        if(ret == -ENOMAPPING) return ret;
+        if(entry != NULL) *entry = pte;
+        *pa = virt_to_phys(ptp) + GET_VA_OFFSET_L3(va);
         /* BLANK END */
         /* LAB 2 TODO 4 END */
         return 0;
@@ -320,7 +355,55 @@ static int map_range_in_pgtbl_common(void *pgtbl, vaddr_t va, paddr_t pa,
          * Return 0 on success.
          */
         /* BLANK BEGIN */
+        s64 total_page_cnt;
+        ptp_t *l0_ptp, *l1_ptp, *l2_ptp, *l3_ptp;
+        pte_t *pte;
+        int ret;
+        int pte_index;
+        int i;
 
+        BUG_ON(pgtbl == NULL);
+        BUG_ON(va % PAGE_SIZE);
+        total_page_cnt = len / PAGE_SIZE + ((len % PAGE_SIZE) ? 1 : 0);
+
+        l0_ptp = (ptp_t *)pgtbl;
+        l1_ptp = NULL;
+        l2_ptp = NULL;
+        l3_ptp = NULL;
+
+        while (total_page_cnt > 0) {
+                // L0
+                ret = get_next_ptp(l0_ptp, L0, va, &l1_ptp, &pte, true, rss);
+                BUG_ON(ret != 0);
+
+                // L1
+                ret = get_next_ptp(l1_ptp, L1, va, &l2_ptp, &pte, true, rss);
+                BUG_ON(ret != 0);
+
+                // L2
+                ret = get_next_ptp(l2_ptp, L2, va, &l3_ptp, &pte, true, rss);
+                BUG_ON(ret != 0);
+
+                // Fill in the pte in l3 page table
+                pte_index = GET_L3_INDEX(va);
+                for(i = pte_index; i < PTP_ENTRIES; i++) {
+                        pte_t new_pte_val;
+
+                        new_pte_val.pte = 0;
+                        new_pte_val.l3_page.is_valid = 1;
+                        new_pte_val.l3_page.is_page = 1;
+                        new_pte_val.l3_page.pfn = pa >> PAGE_SHIFT;
+                        set_pte_flags(&new_pte_val, flags, kind);
+                        l3_ptp->ent[i].pte = new_pte_val.pte;
+
+                        va += PAGE_SIZE;
+                        pa += PAGE_SIZE;
+                        if(rss) *rss += PAGE_SIZE;
+                        total_page_cnt--;
+                        if(total_page_cnt == 0)
+                                break;
+                }
+        }
         /* BLANK END */
         /* LAB 2 TODO 4 END */
         dsb(ishst);
@@ -398,7 +481,70 @@ int unmap_range_in_pgtbl(void *pgtbl, vaddr_t va, size_t len,
          * Return 0 on success.
          */
         /* BLANK BEGIN */
+        u64 total_page_cnt;
+        ptp_t *l0_ptp, *l1_ptp, *l2_ptp, *l3_ptp;
+        pte_t *pte;
+        int ret;
+        int pte_index;
+        int i;
 
+        BUG_ON(pgtbl == NULL);
+        BUG_ON(va % PAGE_SIZE );
+
+        total_page_cnt = len / PAGE_SIZE + (((len % PAGE_SIZE) > 0 )? 1:0  );
+        
+        l1_ptp = NULL;
+        l2_ptp = NULL;
+        l3_ptp = NULL;
+
+        while(total_page_cnt > 0){
+                l0_ptp = (ptp_t *)pgtbl;
+                ret = get_next_ptp(l0_ptp, L0, va, &l1_ptp, &pte, false, rss);
+                if(ret == -ENOMAPPING)
+                {
+                        total_page_cnt -= L0_PER_ENTRY_PAGES;
+                        va += L0_PER_ENTRY_PAGES * PAGE_SIZE;
+                        continue;
+                }
+
+                ret = get_next_ptp(l1_ptp, L1, va, &l2_ptp, &pte, false, rss);
+                if(ret == -ENOMAPPING)
+                {
+                        total_page_cnt -= L1_PER_ENTRY_PAGES; // 512*512页
+                        va += L1_PER_ENTRY_PAGES * PAGE_SIZE; // 1GB
+                        continue;
+                }
+                else if(ret == BLOCK_PTP){
+                        pte->pte = PTE_DESCRIPTOR_INVALID;
+                        va += PAGE_SIZE * PTP_ENTRIES * PTP_ENTRIES; // 1GB
+                        total_page_cnt -= PTP_ENTRIES * PTP_ENTRIES; // 512*512页
+                        continue;
+                }
+
+                ret = get_next_ptp(l2_ptp, L2, va, &l3_ptp, &pte, false,rss);
+                if(ret == -ENOMAPPING){
+                        total_page_cnt -= L2_PER_ENTRY_PAGES; // 512页
+                        va += L2_PER_ENTRY_PAGES * PAGE_SIZE; // 2MB
+                        continue;
+                }
+                else if (ret == BLOCK_PTP)
+                {
+                        pte->pte = PTE_DESCRIPTOR_INVALID;
+                        va += PAGE_SIZE * PTP_ENTRIES; // 2MB
+                        total_page_cnt -= PTP_ENTRIES; // 512页
+                        continue;
+                }
+
+                pte_index = GET_L3_INDEX(va);
+                for (i = pte_index; i < PTP_ENTRIES; ++i)
+                {
+                        l3_ptp->ent[i].pte = PTE_DESCRIPTOR_INVALID;
+                        va += PAGE_SIZE;           
+                        if(rss) *rss -= PAGE_SIZE;
+                        total_page_cnt -= 1; // 1页
+                        if (total_page_cnt == 0) break;
+                }
+        }
         /* BLANK END */
         /* LAB 2 TODO 4 END */
 
@@ -418,7 +564,70 @@ int mprotect_in_pgtbl(void *pgtbl, vaddr_t va, size_t len, vmr_prop_t flags)
          * Return 0 on success.
          */
         /* BLANK BEGIN */
+        s64 total_page_cnt;
+        ptp_t *l0_ptp, *l1_ptp, *l2_ptp, *l3_ptp;
+        pte_t *pte;
+        int ret;
+        int pte_index;
+        int i;
 
+        BUG_ON(pgtbl == NULL);
+        BUG_ON(va % PAGE_SIZE );
+
+        total_page_cnt = len / PAGE_SIZE + (((len % PAGE_SIZE) > 0 )? 1 : 0);
+
+        l0_ptp = (ptp_t *)pgtbl;
+        l1_ptp = NULL;
+        l2_ptp = NULL;
+        l3_ptp = NULL;
+
+
+        while(total_page_cnt > 0){
+                ret = get_next_ptp(l0_ptp, L0, va, &l1_ptp, &pte, false, NULL);
+                if(ret == -ENOMAPPING)
+                {
+                        total_page_cnt -= L0_PER_ENTRY_PAGES;
+                        va += L0_PER_ENTRY_PAGES * PAGE_SIZE;
+                        continue;
+                }
+
+                ret = get_next_ptp(l1_ptp, L1, va, &l2_ptp, &pte, false, NULL);
+                if(ret == -ENOMAPPING)
+                {
+                        total_page_cnt -= L1_PER_ENTRY_PAGES;
+                        va += L1_PER_ENTRY_PAGES * PAGE_SIZE;
+                        continue;
+                }
+                else if(ret == BLOCK_PTP){
+                        set_pte_flags(pte,flags,USER_PTE); 
+                        va += PAGE_SIZE * PTP_ENTRIES * PTP_ENTRIES;
+                        total_page_cnt -= PTP_ENTRIES * PTP_ENTRIES;
+                        continue;
+                }
+
+                ret = get_next_ptp(l2_ptp, L2, va, &l3_ptp, &pte, false,NULL);
+                if(ret == -ENOMAPPING){
+                        total_page_cnt -= L2_PER_ENTRY_PAGES;
+                        va += L2_PER_ENTRY_PAGES * PAGE_SIZE;
+                        continue;
+                }
+                else if (ret == BLOCK_PTP)
+                {
+                        set_pte_flags(pte,flags,USER_PTE); 
+                        va += PAGE_SIZE * PTP_ENTRIES;
+                        total_page_cnt -= PTP_ENTRIES;
+                        continue;
+                }
+
+                pte_index = GET_L3_INDEX(va);
+                for (i = pte_index; i < PTP_ENTRIES; ++i)
+                {
+                        set_pte_flags(&l3_ptp->ent[i], flags, USER_PTE); 
+                        va += PAGE_SIZE;
+                        total_page_cnt -= 1;
+                        if (total_page_cnt == 0) break;
+                }
+        }
         /* BLANK END */
         /* LAB 2 TODO 4 END */
         return 0;
